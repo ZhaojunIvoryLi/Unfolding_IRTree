@@ -1,0 +1,295 @@
+library(GGUM)
+library(SimDesign)
+library(truncnorm)
+library(mirt)
+
+
+
+
+############################################################################################
+############################# data are generated from DIRTree ##############################
+############################################################################################
+
+## 1. Study Design
+
+Design<-expand.grid(Items = c(12),
+                    Samplesize = c(300,500,1000),
+                    Categories = c(4),
+                    Cor = c(0,0.3,0.6),        ## Correlation between focal factor and ERS
+                    Alpha = c(sqrt(0.2),sqrt(0.6),sqrt(1.0)))    ## discrimination on the ERS (square root of the Variance of ERS)            
+
+## 2. Data generation 
+
+Generate.sample<-function(condition, fixed_objects = NULL) {
+  
+  N<-condition$Samplesize
+  I<-condition$Items
+  C<-condition$Categories
+  R<-condition$Cor
+  A<-condition$Alpha
+  
+  #### parameter values based on a 2PL model for measuring the focal trait
+  alpha1 <- runif(n = I, min = 0.5, max = 2)
+  beta0 <- runif(n = I, min = -2, max = 2) # item difficulty for the focal trait
+  #### parameter values based on a 1PL model for measuring the ERS
+  alpha2 <- rep(A,I) # values should be all the same. 
+  beta1 <- runif(n = I, min = -2, max = 2) # item difficulty in the positive direction
+  beta2 <- runif(n = I, min = -2, max = 2) # item difficulty in the negative direction
+  
+  #### covariance matrix of the focal trait and the ERS
+  Sigma <- matrix(c(1,R,R,1),byrow = T,nrow = 2)
+  
+  ## Data generation function 
+  
+  data.gen <- function(alpha1,delta1,tau1,alpha2,beta1,beta2,N,I,Sigma){
+    
+    Theta <- MASS::mvrnorm(n = N,mu=c(0,0),Sigma = Sigma, empirical = T)
+    
+    theta1 <- Theta[,1]
+    theta2 <- Theta[,2]
+    
+    resp <- matrix(NA,nrow = N,ncol = I)
+    
+    for (i in 1:N){
+      
+      for (j in 1:I) {
+        
+        ## Probability for the first stage (2-PL model)
+        p1.0 <- 1/(1+exp(alpha1[j]*theta1[i]-beta0[j]))
+        p1.1 <- exp(alpha1[j]*theta1[i]-beta0[j])/(1+exp(alpha1[j]*theta1[i]-beta0[j]))
+        
+        ## Probability for the second stage (1-PL model) It's 1PL model because all items have the same discrimination
+        # negative direction
+        p2.0 <- 1/(1+exp(alpha2[j]*theta2[i]-beta1[j]))
+        p2.1 <- exp(alpha2[j]*theta2[i]-beta1[j])/(1+exp(alpha2[j]*theta2[i]-beta1[j]))
+        
+        ## positive direction
+        p3.0 <- 1/(1+exp(alpha2[j]*theta2[i]-beta2[j]))
+        p3.1 <- exp(alpha2[j]*theta2[i]-beta2[j])/(1+exp(alpha2[j]*theta2[i]-beta2[j]))
+        
+        ## Note: in both direction, the alpha does not change because it is just a scaling constant for the factor variance, and we assume the factor is the same in both direction.
+        ## That is, we assume the data have direction invariance at the latent variable level, but not at the item level. It is a reasonable assumption (see Jeon & De Boeck, 2019)
+        
+        
+        ## Probability for observed categories
+        p <- c(p1.0*p2.1, # the probability that a response is in the negative direction and is extreme (strongly disagree)
+               p1.0*p2.0, # the probability that a response is in the negative direction and is moderate (disagree)
+               p1.1*p3.0, # the probability that a response is in the positive direction and is moderate (agree)
+               p1.1*p3.1) # the probability that a response is in the positive direction and is extreme (strongly agree)
+        
+        resp[i,j] <- sample(0:3,size = 1,replace = F,prob = p) # from 0 to 3, the categories are: strongly disagree, disagree, agree, and strongly agree
+      }
+    }
+    
+    return(resp)
+  }
+  
+  ## Generate data 
+  data.4 <- data.gen(alpha1,delta1,tau1,alpha2,beta1,beta2,N,I,Sigma) # dataset for the GGUM model and the GRM model
+  mapping.matrix <- matrix(c(0,0,1,1,1,0,NA,NA,NA,NA,0,1),nrow=4)
+  data.2 <- matrix(as.vector(mapping.matrix[(as.vector(data.4)+1),]),nrow = nrow(data.4)) # dataset for the IRTree models (UIRTree and DIRTree)
+  # the first I items are to measure whether the responses are in positive(1) or negative(0) direction
+  # the second I items are to measure if the responses are in the negative direction, whether they are extreme(1) or not(0)
+  # the last I items are to measure if the responses are in the positive direction, whether they are extreme(1) or not(0)
+  
+  colnames(data.4) <-paste0("V",1:I)
+  colnames(data.2) <-paste0("V",1:(3*I))
+  
+  alpha1.pop <- alpha1
+  beta0.pop <- beta0
+  alpha2.pop <- alpha2
+  beta1.pop <- beta1
+  beta2.pop <- beta2
+  
+  dat <- list(data.4,data.2,alpha1.pop,beta0.pop,alpha2.pop,beta1.pop,beta2.pop)
+  
+  dat
+  
+}
+
+## 3. Analyze data 
+
+Analyse<-function(condition,dat,fixed_objects=NULL){
+  
+  N<-condition$Samplesize
+  I<-condition$Items
+  C<-condition$Categories
+  R<-condition$Cor
+  A<-condition$Alpha
+  
+  data.4 <- as.matrix(dat[[1]])
+  data.2 <- as.matrix(dat[[2]])
+  alpha1.pop <- as.vector(dat[[3]])
+  beta0.pop <- as.vector(dat[[4]])
+  alpha2.pop <- as.vector(dat[[5]])
+  beta1.pop <- as.vector(dat[[6]])
+  beta2.pop <- as.vector(dat[[7]])
+  
+  ## Fit models
+  
+  if (isTRUE(I==12)) {
+    
+    mirt.mod.GGUM <- "F1=1-12
+    PRIOR = (1-12,b1,norm,0,3),(1-12,a1,lnorm,0.2,0.5)"
+    
+    mirt.mod.UIRTree <- "F1=1-12
+    F2=13-36
+    COV=F1*F2
+    CONSTRAIN = (13-36, a2)
+    PRIOR = (1-12,b1,norm,0,3),(1-12,a1,lnorm,0.2,0.5)"
+    
+    mirt.mod.GRM <- "F1=1-12"
+    
+    mirt.mod.DIRTree <- "F1=1-12
+    F2=13-36
+    COV=F1*F2
+    CONSTRAIN=(13-36,a2)"
+  }
+  
+  mod.GGUM <- mirt(data = data.4,model = mirt.mod.GGUM, itemtype = "ggum")
+  mod.UIRTree <- mirt(data = data.2,model = mirt.mod.UIRTree, itemtype = c(rep("ggum",I),rep("2PL",2*I)))  # the IRT model is actually 1PL because we constrain all discrimination parameters to be the same
+  mod.GRM <- mirt(data = data.4,model = mirt.mod.GRM, itemtype = "graded")
+  mod.DIRTree <- mirt(data = data.2, model = mirt.mod.DIRTree,itemtype = "2PL")
+  
+  
+  para.GGUM <- coef(mod.GGUM,simplify=T)$items
+  para.UIRTree <- coef(mod.UIRTree,simplify=T)$items
+  para.GRM <- coef(mod.GRM,simplify=T)$item
+  para.DIRTree <- coef(mod.DIRTree,simplify=T)$item
+  
+  if(isTRUE(max(abs(para.GGUM[,2:5]))>=10) | isTRUE(max(abs(para.UIRTree[,3:5])))>=10){stop("Delta estimates reached the limit")}
+  
+  
+  AIC.mod.GGUM <- extract.mirt(mod.GGUM,"AIC")
+  AIC.mod.UIRTree <- extract.mirt(mod.UIRTree,"AIC")
+  AIC.mod.GRM <- extract.mirt(mod.GRM,"AIC")
+  AIC.mod.DIRTree <- extract.mirt(mod.DIRTree,"AIC")
+  BIC.mod.GGUM <- extract.mirt(mod.GGUM,"BIC")
+  BIC.mod.UIRTree <- extract.mirt(mod.UIRTree,"BIC")
+  BIC.mod.GRM <- extract.mirt(mod.GRM,"BIC")
+  BIC.mod.DIRTree <- extract.mirt(mod.DIRTree,"BIC")
+  
+  sign.DIRTree.beta0 <- sign(cor(para.DIRTree[1:I,3],-beta0.pop))
+  sign.DIRTree.beta1 <- sign(cor(para.DIRTree[(I+1):(2*I),3],-beta1.pop))
+  sign.DIRTree.beta2 <- sign(cor(para.DIRTree[(2*I+1):(3*I),3],-beta2.pop))
+  sign.UIRTree.beta1 <- sign(cor(para.UIRTree[(I+1):(2*I),6],-beta1.pop))
+  sign.UIRTree.beta2 <- sign(cor(para.UIRTree[(2*I+1):(3*I),6],-beta2.pop))
+  
+  
+  #### Summarize results
+  
+  ret<-c(
+    Abis.alpha1.GGUM <- mean(abs(para.GGUM[,1]-alpha1.pop)),
+    Abis.alpha1.UIRTree <- mean(abs(para.UIRTree[1:I,1]-alpha1.pop)),
+    Abis.alpha2.UIRTree <- mean(abs(para.UIRTree[(1+I),2]-alpha2.pop)),
+    Abis.beta1.UIRTree <- mean(abs(para.UIRTree[(I+1):(2*I),6]*sign.UIRTree.beta1+beta1.pop)),
+    Abis.beta2.UIRTree <- mean(abs(para.UIRTree[(2*I+1):(3*I),6]*sign.UIRTree.beta2+beta2.pop)),
+    Abis.cor.UIRTree <- abs(abs(coef(mod.UIRTree,simplify=T)$cov[1,2])-R),
+    Abis.alpha1.GRM <- mean(abs(para.GRM[,1]-alpha1.pop)),
+    Abis.alpha1.DIRTree <- mean(abs(para.DIRTree[1:I,1]-alpha1.pop)),
+    Abis.beta0.DIRTree <- mean(abs(para.DIRTree[1:I,3]*sign.DIRTree.beta0+beta0.pop)),
+    Abis.alpha2.DIRTree <- mean(abs(para.DIRTree[(1+I):(2*I),2]-alpha2.pop)),
+    Abis.beta1.DIRTree <- mean(abs(para.DIRTree[(1+I):(2*I),3]*sign.DIRTree.beta1+beta1.pop)),
+    Abis.beta2.DIRTree <- mean(abs(para.DIRTree[(1+2*I):(3*I),3]*sign.DIRTree.beta2+beta2.pop)),  
+    Abis.cor.DIRTree <- abs(abs(coef(mod.DIRTree,simplify=T)$cov[1,2])-R),
+    
+    
+    Bias.alpha1.GGUM <- mean((para.GGUM[,1]-alpha1.pop)),
+    Bias.alpha1.UIRTree <- mean((para.UIRTree[1:I,1]-alpha1.pop)),
+    Bias.alpha2.UIRTree <- mean((para.UIRTree[(1+I),2]-alpha2.pop)),
+    Bias.beta1.UIRTree <- mean((para.UIRTree[(I+1):(2*I),6]*sign.UIRTree.beta1+beta1.pop)),
+    Bias.beta2.UIRTree <- mean((para.UIRTree[(2*I+1):(3*I),6]*sign.UIRTree.beta2+beta2.pop)),
+    Bias.cor.UIRTree <- (abs(coef(mod.UIRTree,simplify=T)$cov[1,2])-R),
+    Bias.alpha1.GRM <- mean((para.GRM[,1]-alpha1.pop)),
+    Bias.alpha1.DIRTree <- mean((para.DIRTree[1:I,1]-alpha1.pop)),
+    Bias.beta0.DIRTree <- mean((para.DIRTree[1:I,3]*sign.DIRTree.beta0+beta0.pop)),
+    Bias.alpha2.DIRTree <- mean((para.DIRTree[(1+I):(2*I),2]-alpha2.pop)),
+    Bias.beta1.DIRTree <- mean((para.DIRTree[(1+I):(2*I),3]*sign.DIRTree.beta1+beta1.pop)),
+    Bias.beta2.DIRTree <- mean((para.DIRTree[(1+2*I):(3*I),3]*sign.DIRTree.beta2+beta2.pop)),  
+    Bias.cor.DIRTree <- (abs(coef(mod.DIRTree,simplify=T)$cov[1,2])-R),
+    
+    RMSE.alpha1.GGUM <- SimDesign::RMSE(unname(para.GGUM[,1]),alpha1.pop),
+    RMSE.alpha1.UIRTree <- SimDesign::RMSE(unname(para.UIRTree[1:I,1]),alpha1.pop),
+    RMSE.alpha2.UIRTree <- SimDesign::RMSE(unname(para.UIRTree[(1+I):(2*I),2]),alpha2.pop),
+    RMSE.beta1.UIRTree <- SimDesign::RMSE(unname(para.UIRTree[(I+1):(2*I),6])*sign.UIRTree.beta1,-beta1.pop),
+    RMSE.beta2.UIRTree <- SimDesign::RMSE(unname(para.UIRTree[(2*I+1):(3*I),6])*sign.UIRTree.beta2,-beta2.pop),
+    RMSE.cor.UIRTree <- SimDesign::RMSE(abs(coef(mod.UIRTree,simplify=T)$cov[1,2]),R),
+    RMSE.alpha1.GRM <- SimDesign::RMSE(unname(para.GRM[1:I,1]),alpha1.pop),
+    RMSE.alpha1.DIRTree <- SimDesign::RMSE(unname(para.DIRTree[1:I,1]),alpha1.pop),
+    RMSE.beta0.DIRTree <- SimDesign::RMSE(unname(para.DIRTree[1:I,3])*sign.DIRTree.beta0,-beta0.pop),
+    RMSE.alpha2.DIRTree <- SimDesign::RMSE(unname(para.DIRTree[(1+I):(2*I),2]),alpha2.pop),
+    RMSE.beta1.DIRTree <- SimDesign::RMSE(unname(para.DIRTree[(1+I):(2*I),3])*sign.DIRTree.beta1,-beta1.pop),
+    RMSE.beta2.DIRTree <- SimDesign::RMSE(unname(para.DIRTree[(1+2*I):(3*I),3])*sign.DIRTree.beta2,-beta2.pop),
+    RMSE.cor.DIRTree <- SimDesign::RMSE(abs(coef(mod.DIRTree,simplify=T)$cov[1,2]),R),
+    
+    AIC.GGUM <- ifelse(AIC.mod.GGUM==min(AIC.mod.UIRTree,AIC.mod.GGUM,AIC.mod.GRM,AIC.mod.DIRTree),1,0),
+    AIC.UIRTree <- ifelse(AIC.mod.UIRTree==min(AIC.mod.UIRTree,AIC.mod.GGUM,AIC.mod.GRM,AIC.mod.DIRTree),1,0),
+    AIC.GRM <- ifelse(AIC.mod.GRM==min(AIC.mod.UIRTree,AIC.mod.GGUM,AIC.mod.GRM,AIC.mod.DIRTree),1,0),
+    AIC.DIRTree <- ifelse(AIC.mod.DIRTree==min(AIC.mod.UIRTree,AIC.mod.GGUM,AIC.mod.GRM,AIC.mod.DIRTree),1,0),
+    
+    BIC.GGUM <- ifelse(BIC.mod.GGUM==min(BIC.mod.UIRTree,BIC.mod.GGUM,BIC.mod.GRM,BIC.mod.DIRTree),1,0),
+    BIC.UIRTree <- ifelse(BIC.mod.UIRTree==min(BIC.mod.UIRTree,BIC.mod.GGUM,BIC.mod.GRM,BIC.mod.DIRTree),1,0),
+    BIC.GRM <- ifelse(BIC.mod.GRM==min(BIC.mod.UIRTree,BIC.mod.GGUM,BIC.mod.GRM,BIC.mod.DIRTree),1,0),
+    BIC.DIRTree <- ifelse(BIC.mod.DIRTree==min(BIC.mod.UIRTree,BIC.mod.GGUM,BIC.mod.GRM,BIC.mod.DIRTree),1,0)
+    
+  )
+  
+  return(ret)
+  
+  }
+
+
+## 4. Summarize results
+
+Summarise <- function(condition , results , fixed_objects = NULL){
+  
+  ret<-colMeans(results,na.rm = T)
+  ret
+  
+}
+
+## 5. Run simulation 
+Sim.DIRTreedata <- runSimulation(design = Design,
+                                 replications =100,
+                                 parallel = T ,
+                                 generate = Generate.sample,
+                                 analyse = Analyse,
+                                 summarise = Summarise,
+                                 warnings_as_errors = T,
+                                 save_results = T,
+                                 progress = T,
+                                 ncores = 7,
+                                 max_errors = 20,
+                                 verbose = T,
+                                 packages=c("mirt","MASS","truncnorm","GGUM"))
+
+
+
+colnames(Sim.DIRTreedata) <- c(colnames(Sim.DIRTreedata)[1:5],
+                               "Abis.alpha1.GGUM",
+                               "Abis.alpha1.UIRTree","Abis.alpha2.UIRTree","Abis.beta1.UIRTree","Abis.beta2.UIRTree","Abis.cor.UIRTree",
+                               "Abis.alpha1.GRM",
+                               "Abis.alpha1.DIRTree","Abis.beta0.DIRTree","Abis.alpha2.DIRTree","Abis.beta1.DIRTree","Abis.beta2.DIRTree","Abis.cor.DIRTree",
+                               "Bias.alpha1.GGUM",
+                               "Bias.alpha1.UIRTree","Bias.alpha2.UIRTree","Bias.beta1.UIRTree","Bias.beta2.UIRTree","Bias.cor.UIRTree",
+                               "Bias.alpha1.GRM",
+                               "Bias.alpha1.DIRTree","Bias.beta0.DIRTree","Bias.alpha2.DIRTree","Bias.beta1.DIRTree","Bias.beta2.DIRTree","Bias.cor.DIRTree",
+                               "RMSE.alpha1.GGUM",
+                               "RMSE.alpha1.UIRTree","RMSE.alpha2.UIRTree","RMSE.beta1.UIRTree","RMSE.beta2.UIRTree","RMSE.cor.UIRTree",
+                               "RMSE.alpha1.GRM",
+                               "RMSE.alpha1.DIRTree","RMSE.beta0.DIRTree","RMSE.alpha2.DIRTree","RMSE.beta1.DIRTree","RMSE.beta2.DIRTree","RMSE.cor.DIRTree",
+                               "AIC.GGUM","AIC.UIRTree","AIC.GRM","AIC.DIRTree",
+                               "BIC.GGUM", "BIC.UIRTree", "BIC.GRM", "BIC.DIRTree", 
+                               colnames(Sim.DIRTreedata)[(ncol(Sim.DIRTreedata)-4):ncol(Sim.DIRTreedata)])
+
+write.table(Sim.DIRTreedata,"sim_4models_DIRTreedata_0704.csv",row.names = F,sep = ",")
+saveRDS(Sim.DIRTreedata,"Sim_4models_DIRTreedata_0704.rds")
+
+
+
+
+
+
+
+
+
